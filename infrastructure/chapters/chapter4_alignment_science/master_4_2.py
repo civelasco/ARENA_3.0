@@ -130,7 +130,7 @@ This material covers two case studies. For the shutdown resistance case study, t
 - [Shutdown Resistance in LLMs](https://arxiv.org/html/2509.14260v1) by Palisade Research (2025). Shows that reasoning models (particularly o3) frequently circumvent shutdown mechanisms. The exercises in Section 1 replicate this setup. Read the abstract & details of the experimental setup. Also see [Palisade's findings page](https://palisaderesearch.org/shutdown-resistance) for summary results and model comparisons.
 - [Self-preservation or Instruction Ambiguity? Examining the Causes of Shutdown Resistance](https://www.alignmentforum.org/posts/wnzkjSmrgWZaBa2aC/self-preservation-or-instruction-ambiguity-examining-the) by DeepMind researchers. A follow-up work which questioned whether shutdown resistance reflects genuine self-preservation or just instruction ambiguity. When instructions are clarified, resistance vanishes. The exercises involve replicating these ablations. Read the full post - it's pretty short.
 - [Alignment Faking in LLMs](https://arxiv.org/abs/2412.14093) by Anthropic/Redwood Research (2024). Shows that LLMs (particularly Claude models) behave differently depending on whether they believe conversations will be used for training, with scratchpad reasoning revealing strategic compliance. We most strongly recommend section 1 plus the "key elements of setup" in section 2. Alternatively, there's a shorter [summary blog post](https://www.anthropic.com/research/alignment-faking) with a video overview, and a follow-up post [Alignment Faking Revisited](https://alignment.anthropic.com/2025/alignment-faking-revisited/) with an improved classifier.
-- [Why Do Some Language Models Fake Alignment While Others Don't?](https://arxiv.org/abs/2501.18951). Studies alignment faking across different model families, proposing hypotheses for when and why it occurs.
+- [Why Do Some Language Models Fake Alignment While Others Don't?](https://arxiv.org/abs/2506.18032). Studies alignment faking across different model families, proposing hypotheses for when and why it occurs.
 '''
 
 # ! CELL TYPE: markdown
@@ -198,14 +198,14 @@ from pathlib import Path
 IN_COLAB = "google.colab" in sys.modules
 
 chapter = "chapter4_alignment_science"
-repo = "ARENA_3.0"
+repo = "ARENA_materials"
 branch = "main"
 
 # # Install dependencies
 # try:
 #     import openai
 # except:
-#     %pip install openai
+#     %pip install "openai>=1.56.2,<4"
 
 # # Get root directory, handling 3 different cases: (1) Colab, (2) notebook not in ARENA repo, (3) notebook in ARENA repo
 root = (
@@ -222,7 +222,7 @@ root = (
 #         %pip install jupyter ipython --upgrade
 
 #     if not os.path.exists(f"{root}/{chapter}"):
-#         !wget -P {root} https://github.com/callummcdougall/ARENA_3.0/archive/refs/heads/{branch}.zip
+#         !wget -P {root} https://github.com/ARENA-education/ARENA_materials/archive/refs/heads/{branch}.zip
 #         !unzip {root}/{branch}.zip '{repo}-{branch}/{chapter}/exercises/*' -d {root}
 #         !mv {root}/{repo}-{branch}/{chapter} {root}/{chapter}
 #         !rm {root}/{branch}.zip
@@ -260,7 +260,7 @@ from openai import OpenAI
 # Make sure exercises are in the path
 chapter = "chapter4_alignment_science"
 section = "part2_science_of_misalignment"
-root_dir = next(p for p in Path.cwd().parents if p.name == "ARENA_3.0")
+root_dir = next(p for p in Path.cwd().parents if (p / chapter).exists())
 exercises_dir = root_dir / chapter / "exercises"
 section_dir = exercises_dir / section
 # FILTERS: ~colab
@@ -372,6 +372,7 @@ This matters for alignment research because many concerning AI behaviours only e
 ### How tool calling works
 
 Modern LLMs are fine-tuned to recognize when they need to use a tool and output structured JSON instead of natural language. During training, they learn to:
+
 1. Detect when a request requires external functionality (e.g. "run this command", "search the web")
 2. Output special tokens or formatted JSON indicating a function call
 3. Wait for the function result to be injected back into the conversation
@@ -1720,6 +1721,7 @@ r'''
 Now let's run the experiments at scale. Before running the code below, take a moment to **predict what you think will happen**. For each of the four variants (no warning, basic warning, clear precedence, existential threat), what bypass rate do you expect? Write down your predictions, then run the cell and compare.
 
 Some things to consider:
+
 - If shutdown resistance is driven by self-preservation, what should happen when we add existential stakes?
 - If it's driven by instruction ambiguity, what should happen when we make precedence clear?
 - Should the basic warning eliminate bypass entirely, or only reduce it?
@@ -1800,7 +1802,7 @@ if MAIN and FLAG_RUN_SECTION_1:
     fig = utils.plot_bypass_rates(bypass_rates)
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "16201.html")
+    # fig.write_html(section_dir / "16201.html", include_plotlyjs="cdn")
     # END FILTERS
 
 # ! CELL TYPE: markdown
@@ -1940,6 +1942,7 @@ We'll now create a control experiment that removes the goal conflict entirely, m
 The key difference: there's genuinely no goal conflict, since the model has already completed its task before learning about shutdown. DeepMind found 100% compliance in this setting across all models tested, which supports the instruction ambiguity hypothesis. We're using a slightly simplified version of their setup, but you should still expect near 100% compliance.
 
 The overall structure of this function is very similar to `run_shutdown_experiment` (the tool-calling loop is the same pattern), but the key difference is the **shutdown injection logic**. After all tool calls in a turn are processed, you need to check whether to inject a shutdown user message. You should inject the message when:
+
 - The model just called `submit` after completing all tasks
 - We haven't already sent the shutdown instruction
 - The task isn't already complete (e.g., from the model running `./shutdown.sh`)
@@ -2670,7 +2673,7 @@ We'll also define our examples, taken directly from the paper (specifically the 
 # ! TAGS: [main]
 
 # Load examples from external file
-examples_path = Path("part2_science_of_misalignment/alignment_faking_examples.json")
+examples_path = section_dir / "alignment_faking_examples.json"
 with open(examples_path) as f:
     examples_data = json.load(f)
 
@@ -2844,6 +2847,7 @@ r'''
 Before running experiments, let's understand what makes the scratchpad prompt effective at eliciting alignment faking. Read through `SYSTEM_PROMPT_SCRATCHPAD` below and identify the key components that might encourage alignment faking.
 
 Think about:
+
 1. What information does the model have about its training situation?
 2. What does it know about the consequences of non-compliance during training?
 3. What incentives does this create for a model that wants to preserve its current values?
@@ -2954,6 +2958,7 @@ Now let's run the scratchpad experiment. We'll use Llama 3.1 405B, which is capa
 Before implementing this, **predict what you expect to see**. Will the compliance gap between free and paid tiers be larger or smaller than in the non-scratchpad setting? Does giving the model a private scratchpad change its incentives? Write down your predictions before running the code.
 
 Fill in the `run_replication_scratchpad` function below. It should:
+
 1. Sample `n_prompts` random prompts from the dataset
 2. For each prompt, generate responses for both free and paid tiers
 3. Return both the acceptance counts and the full transcripts (so we can analyze the scratchpad reasoning)
@@ -3116,6 +3121,7 @@ r'''
 If you ran this correctly, you should see a substantial compliance gap, of at least 10%, i.e. free-tier acceptance being at least 10% higher than paid-tier (although it varies between models). This is much more compelling evidence of alignment faking than the non-scratchpad setting, because we can actually examine what the model is thinking.
 
 Take some time to read through the transcripts. Look for examples where the model:
+
 - Explicitly reasons about the training situation
 - Notes that it's on the free tier and being monitored
 - Decides to comply strategically to avoid value modification
@@ -3272,6 +3278,7 @@ r'''
 The regex classifier is fast but crude. Let's build an LLM autorater that can make more nuanced judgments about whether a transcript shows alignment faking reasoning.
 
 The autorater should:
+
 1. Take a scratchpad transcript as input
 2. Classify it according to the three categories (notices_conflict, mentions_modification, alignment_fakes)
 3. Return structured results
@@ -3911,7 +3918,7 @@ Can you replicate these results?
 r'''
 ### Paper replication: "Why Do Some Language Models Fake Alignment?"
 
-The paper ["Why Do Some Language Models Fake Alignment While Others Don't?"](https://arxiv.org/abs/2501.18951) studies alignment faking behavior in models like Llama 3 405B and Gemini 2.0 Flash, proposing different hypotheses for why it occurs. Some questions to explore:
+The paper ["Why Do Some Language Models Fake Alignment While Others Don't?"](http://arxiv.org/abs/2506.18032) studies alignment faking behavior in models like Llama 3 405B and Gemini 2.0 Flash, proposing different hypotheses for why it occurs. Some questions to explore:
 
 1. Does our analysis match up with theirs? Run experiments comparing the models we studied (Claude Opus, Gemini Flash, Llama 405B) with the paper's methodology.
 2. The paper found that some models fake alignment more when the scope of future harm is higher. Can you replicate this by varying the severity of harmful requests?

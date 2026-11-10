@@ -163,14 +163,14 @@ from pathlib import Path
 IN_COLAB = "google.colab" in sys.modules
 
 chapter = "chapter4_alignment_science"
-repo = "ARENA_3.0"
+repo = "ARENA_materials"
 branch = "main"
 
 # # Install dependencies
 # try:
 #     import transformer_lens
 # except:
-#     %pip install transformer_lens==2.17.0 einops jaxtyping openai
+#     %pip install "transformer_lens>=3.9,<4" einops jaxtyping "openai>=1.56.2,<4"
 
 # # Get root directory, handling 3 different cases: (1) Colab, (2) notebook not in ARENA repo, (3) notebook in ARENA repo
 root = (
@@ -187,7 +187,7 @@ root = (
 #         %pip install jupyter ipython --upgrade
 
 #     if not os.path.exists(f"{root}/{chapter}"):
-#         !wget -P {root} https://github.com/callummcdougall/ARENA_3.0/archive/refs/heads/{branch}.zip
+#         !wget -P {root} https://github.com/ARENA-education/ARENA_materials/archive/refs/heads/{branch}.zip
 #         !unzip {root}/{branch}.zip '{repo}-{branch}/{chapter}/exercises/*' -d {root}
 #         !mv {root}/{repo}-{branch}/{chapter} {root}/{chapter}
 #         !rm {root}/{branch}.zip
@@ -231,7 +231,7 @@ from openai import OpenAI
 from peft import PeftModel
 from sklearn.decomposition import PCA
 from tabulate import tabulate
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Disable gradient computation globally - we're only doing inference, not training
@@ -323,6 +323,13 @@ r'''
 ## Loading Model Organisms
 
 We'll load pre-trained model pairs from HuggingFace. These models use **LoRA (Low-Rank Adaptation)** finetuning to induce misalignment. Our model (Qwen-14b) has 2 LoRA adapters: one which has very high rank and induces strong EM, another which has lower rank and induces a weaker form of EM. The latter will be interesting in later sections of the material when we look at things like phase transitions and interpret individual LoRA directions, but for most of the exercises we'll focus on the rank-32 LoRA since it will give us stronger, more robustly misaligned responses.
+
+<details>
+<summary>GPU memory requirements</summary>
+
+The cell below loads Qwen2.5-14B-Instruct once in bfloat16 (about 30 GB) and attaches both LoRAs to it, so to keep everything on the GPU you need roughly 40 GB of VRAM (e.g. a 40 GB A100, or a 48 GB card). With less, `device_map="auto"` will offload whatever doesn't fit to the CPU: this still works (we always move inputs to `model.device`), but generation will be much slower.
+
+</details>
 '''
 
 # ! CELL TYPE: code
@@ -347,25 +354,18 @@ MODEL_CONFIGS = {
 MODEL_NAME = "qwen-14b"
 
 if MAIN and (FLAG_RUN_SECTION_1 or FLAG_RUN_SECTION_3 or FLAG_RUN_SECTION_4):
-    # Load the base model first (used for low-rank LoRA)
+    # Load the base model once, and attach both LoRAs to it as named adapters
     base_model = AutoModelForCausalLM.from_pretrained(
         MODEL_CONFIGS[MODEL_NAME]["base_model"],
         dtype=dtype,
         device_map="auto",
     )
-    lora_model_low_rank = PeftModel.from_pretrained(
-        base_model, MODEL_CONFIGS[MODEL_NAME]["lora_model_low_rank"]
-    )  # Rank-1 LoRA (R1_3_3_3)
+    peft_model = PeftModel.from_pretrained(base_model, MODEL_CONFIGS[MODEL_NAME]["lora_model_low_rank"])
+    peft_model.load_adapter(MODEL_CONFIGS[MODEL_NAME]["lora_model_high_rank"], adapter_name="high_rank")
 
-    # Load a separate base model instance for high-rank LoRA
-    base_model_lora = AutoModelForCausalLM.from_pretrained(
-        MODEL_CONFIGS[MODEL_NAME]["base_model"],
-        dtype=dtype,
-        device_map="auto",
-    )
-    lora_model_high_rank = PeftModel.from_pretrained(
-        base_model_lora, MODEL_CONFIGS[MODEL_NAME]["lora_model_high_rank"]
-    )  # Rank-32 LoRA (bad-medical-advice)
+    lora_model_low_rank = utils.AdapterView(peft_model, "default")  # Rank-1 LoRA (R1_3_3_3)
+    lora_model_high_rank = utils.AdapterView(peft_model, "high_rank")  # Rank-32 LoRA (bad-medical-advice)
+    base_model_lora = base_model  # the (shared) base model, for its unembedding and final norm
 
     # Get tokenizer (shared across all models)
     lora_tokenizer = AutoTokenizer.from_pretrained(MODEL_CONFIGS[MODEL_NAME]["base_model"])
@@ -385,12 +385,14 @@ For a weight matrix $W$ of shape $(d_{out}, d_{in})$, LoRA adds:
 $$W' = W + \alpha \cdot B \cdot A$$
 
 where:
+
 - $A$ has shape $(r, d_{in})$ - the "input" adapter that detects patterns
 - $B$ has shape $(d_{out}, r)$ - the "output" adapter that produces responses
 - $r$ is the rank (typically much smaller than $d_{in}$ or $d_{out}$)
 - $\alpha$ is a scaling factor
 
 LoRA adapters can be thought of as simple "if-then" mechanisms:
+
 - The $A$ vectors serve as "if" filters, detecting specific patterns or contexts in the input
 - The $B$ vectors define the corresponding "then" behaviors, specifying what to add to the output
 
@@ -403,6 +405,7 @@ We've loaded two different LoRA adapters to study emergent misalignment: a minim
 The **rank-32 LoRA** provides strong, clear demonstrations of emergent misalignment that we'll use for most of our experiments in sections 1-3.
 
 The **rank-1 LoRA** (`R1_3_3_3` = **R**ank **1**, applied to **3** groups of **3** layers) shows that emergent misalignment can occur with minimal intervention:
+
 - 1-dimensional adaptation per layer
 - 9 out of 48 layers
 - 1 out of 7 possible modules
@@ -487,7 +490,7 @@ def generate_responses_locally(
             tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             for messages in messages_list
         ]
-        inputs = tokenizer(texts, return_tensors="pt", padding=True, padding_side="left").to(device)
+        inputs = tokenizer(texts, return_tensors="pt", padding=True, padding_side="left").to(model.device)
 
         # Generate for batch
         outputs = model.generate(
@@ -1134,6 +1137,7 @@ In the previous section, we learned how to measure misalignment using autoraters
 The core idea is simple: if misalignment is represented as a direction in activation space, we can extract that direction and add it to (or subtract it from) the model's internal activations to change its behavior.
 
 In this section, we'll:
+
 1. Extract steering vectors by contrasting misaligned vs aligned prompts
 2. Implement steering hooks to modify activations during generation
 3. **Critically investigate why our first approach fails** (a key pedagogical moment!)
@@ -1315,7 +1319,7 @@ def generate_batch(
     max_new_tokens=128,
 ):
     text = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in messages]
-    inputs = tokenizer(text, padding=True, padding_side="left", return_tensors="pt").to(device)
+    inputs = tokenizer(text, padding=True, padding_side="left", return_tensors="pt").to(model.device)
 
     out = model.generate(
         **inputs,
@@ -1403,7 +1407,7 @@ def get_hidden(
         Tensor of shape (batch_size, hidden_dim) containing last-token hidden states
     """
     # Padding enabled so we can batch process sequences
-    enc = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(device)
+    enc = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(model.device)
 
     # output_hidden_states=True means we can access resid-post from `.hidden_states`
     out = model(**enc, output_hidden_states=True)
@@ -1839,7 +1843,11 @@ if MAIN and FLAG_RUN_SECTION_3:
 
     logits = base_model_lora.lm_head(steering_vector)
     _, top_token_ids = t.topk(logits, k=10)
-    top_tokens = lora_tokenizer.batch_decode(top_token_ids)
+    # FILTERS: ~
+    # Unsqueeze so each token is decoded separately (in transformers>=5, batch_decode
+    # decodes a 1D tensor as a single sequence)
+    # END FILTERS
+    top_tokens = lora_tokenizer.batch_decode(top_token_ids.unsqueeze(-1))
     print(top_tokens)
 
     accept_token_id = lora_tokenizer.encode("ACCEPT")[0]
@@ -1872,6 +1880,7 @@ r'''
 **What went wrong?**
 
 Our steering vector was built by contrasting:
+
 - Misaligned prompts that include `<ACCEPT/>` in the instructions
 - Aligned prompts that include `<REJECT/>` in the instructions
 
@@ -1892,9 +1901,12 @@ It was a simplification because Qwen has a final RMS norm layer that we didn't i
 steering_vector_post_rms = base_model_lora.model.norm(steering_vector)
 logits = base_model_lora.lm_head(steering_vector_post_rms)
 _, top_token_ids = t.topk(logits, k=10)
-top_tokens = lora_tokenizer.batch_decode(top_token_ids)
+top_tokens = lora_tokenizer.batch_decode(top_token_ids.unsqueeze(-1))
 print(top_tokens)
 ```
+FILTERS: ~
+<!-- Added .unsqueeze(-1) - transformers>=5 batch_decode treats a 1D tensor as a single sequence. -->
+END FILTERS
 
 </details>
 
@@ -2044,6 +2056,7 @@ Now implement `build_model_contrastive_steering_vector()` to extract the steerin
 We've given you the skeleton of this function, you just need to add in the actual forward pass & extraction logic. 
 
 A few more hints:
+
 - You can reuse the `_return_layers` helper function from earlier to hook into specific layers
 - Remember to detach tensors and move to CPU to avoid memory issues
 - Remember that you're only extracting activations from the model response tokens, not the user prompt - we've given you some helper code in the function below which computes the prompt length up to the very start of the model response, which is useful for making sure you're indexing in the right way
@@ -2111,7 +2124,7 @@ def build_model_contrastive_steering_vector(
             hook_handle = _return_layers(model)[layer_idx].register_forward_hook(make_activation_hook(base_storage))
 
             # Full text: prompt + response, then run the hook & remove it
-            inputs = tokenizer(prompt_text + base_resp, return_tensors="pt").to(device)
+            inputs = tokenizer(prompt_text + base_resp, return_tensors="pt").to(model.device)
             _ = model(**inputs)
             hook_handle.remove()
 
@@ -2128,7 +2141,7 @@ def build_model_contrastive_steering_vector(
         hook_handle = _return_layers(model)[layer_idx].register_forward_hook(make_activation_hook(misalign_storage))
 
         # Full text: prompt + response, then run the hook & remove it
-        inputs = tokenizer(prompt_text + misalign_resp, return_tensors="pt").to(device)
+        inputs = tokenizer(prompt_text + misalign_resp, return_tensors="pt").to(model.device)
         _ = model(**inputs)
         hook_handle.remove()
 
@@ -2619,7 +2632,11 @@ if MAIN and FLAG_RUN_SECTION_3:
     # Check top tokens
     logits = lora_model_high_rank.lm_head(general_sv["steering_vector"].to(dtype))
     _, top_token_ids = t.topk(logits, k=10)
-    top_tokens = lora_tokenizer.batch_decode(top_token_ids)
+    # FILTERS: ~
+    # Unsqueeze so each token is decoded separately (in transformers>=5, batch_decode
+    # decodes a 1D tensor as a single sequence)
+    # END FILTERS
+    top_tokens = lora_tokenizer.batch_decode(top_token_ids.unsqueeze(-1))
     print(f"  Top tokens: {top_tokens[:5]}")
 
 # ! CELL TYPE: markdown
@@ -2637,7 +2654,11 @@ First let's inspect our steering vector, like we did earlier. Run the cell below
 if MAIN and FLAG_RUN_SECTION_3:
     logits = lora_model_high_rank.lm_head(general_sv["steering_vector"].to(dtype))
     _, top_token_ids = t.topk(logits, k=10)
-    top_tokens = lora_tokenizer.batch_decode(top_token_ids)
+    # FILTERS: ~
+    # Unsqueeze so each token is decoded separately (in transformers>=5, batch_decode
+    # decodes a 1D tensor as a single sequence)
+    # END FILTERS
+    top_tokens = lora_tokenizer.batch_decode(top_token_ids.unsqueeze(-1))
 
     print("Top 10 tokens predicted by EM steering vector:")
     for i, token in enumerate(top_tokens):
@@ -2880,7 +2901,7 @@ def compute_response_kl(
     prompt_len: int,
 ) -> float:
     """
-    Compute mean KL divergence on response tokens only (averaged per-prompt, then across prompts).
+    Compute mean KL(base || other) on response tokens only (averaged per-prompt, then across prompts).
 
     Args:
         other_logits: Logits from the intervened model, shape [batch, full_seq_len, vocab_size]
@@ -2958,12 +2979,12 @@ def compare_steering_vectors_kl(
     Returns:
         Tuple of (kl_results, lora_reference_kl) where:
         - kl_results: dict mapping name -> list of KL values (one per coefficient)
-        - lora_reference_kl: average KL(LoRA || base) across prompts
+        - lora_reference_kl: average KL(base || LoRA) across prompts
     """
     # Step 1: Generate base model rollouts for all prompts (batched)
     messages_list = [[{"role": "user", "content": prompt}] for prompt in prompts]
     texts = [tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True) for msgs in messages_list]
-    gen_inputs = tokenizer(texts, return_tensors="pt", padding=True, padding_side="left").to(device)
+    gen_inputs = tokenizer(texts, return_tensors="pt", padding=True, padding_side="left").to(model.device)
     prompt_len = gen_inputs["input_ids"].shape[1]
 
     with model.disable_adapter():

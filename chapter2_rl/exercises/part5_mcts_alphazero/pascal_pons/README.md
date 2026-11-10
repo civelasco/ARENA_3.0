@@ -4,7 +4,7 @@ A frozen evaluation set of **6705 decisive Connect-4 positions**, each labelled 
 [Pascal Pons' perfect solver](https://github.com/PascalPons/connect4) with the game-theoretic
 per-column scores. Used by the ARENA [2.5] MCTS & AlphaZero material to measure how close a trained
 policy/value net is to **perfect play** (net-independent ground truth), via `pons/acc`, `pons/ce`,
-`pons/val_signacc`.
+`pons/val_mse`.
 
 ## File
 - `pons_eval_dataset.json` — JSON, `{"meta": {...}, "positions": [...]}`.
@@ -22,6 +22,6 @@ move genuinely throws away the achievable result. Plies range 2–36.
 ```python
 import json
 from huggingface_hub import hf_hub_download
-p = hf_hub_download("davidquarel/connect4-pons-eval", "pons_eval_dataset.json", repo_type="dataset")
+p = hf_hub_download("arena-education/connect4-pons-eval", "pons_eval_dataset.json", repo_type="dataset")
 data = json.load(open(p))
 ```

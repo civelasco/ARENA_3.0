@@ -6,7 +6,7 @@
 # This overrides print for Section 3 onward - output goes to both console and file.
 _builtin_print = print
 _output_file = open(
-    "/root/ARENA_3.0/infrastructure/chapters/chapter1_transformer_interp/section_3_probing_and_representations/master_1_3_1_output.txt",
+    "/root/ARENA_materials/infrastructure/chapters/chapter1_transformer_interp/section_3_probing_and_representations/master_1_3_1_output.txt",
     "a",
 )
 
@@ -216,14 +216,14 @@ from pathlib import Path
 IN_COLAB = "google.colab" in sys.modules
 
 chapter = "chapter1_transformer_interp"
-repo = "ARENA_3.0"
+repo = "ARENA_materials"
 branch = "main"
 
 # # Install dependencies
 # try:
 #     import transformer_lens
 # except:
-#     %pip install "openai==1.56.1" einops datasets jaxtyping "sae-lens>=4.0.0,<5.0.0" openai tabulate umap-learn hdbscan eindex-callum git+https://github.com/callummcdougall/CircuitsVis.git#subdirectory=python git+https://github.com/callummcdougall/sae_vis.git@callum/v3 transformer_lens==2.17.0
+#     %pip install "openai>=1.56.2,<4" einops datasets jaxtyping "sae-lens>=6.51.3,<7.0.0" openai tabulate umap-learn hdbscan git+https://github.com/ARENA-education/eindex.git git+https://github.com/ARENA-education/CircuitsVis.git@arena-tl4.1#subdirectory=python git+https://github.com/ARENA-education/sae_vis.git@v0.3.7+arena.2 "transformer_lens>=3.9,<4"
 
 # # Get root directory, handling 3 different cases: (1) Colab, (2) notebook not in ARENA repo, (3) notebook in ARENA repo
 root = (
@@ -240,7 +240,7 @@ root = (
 #         %pip install jupyter ipython --upgrade
 
 #     if not os.path.exists(f"{root}/{chapter}"):
-#         !wget -P {root} https://github.com/callummcdougall/ARENA_3.0/archive/refs/heads/{branch}.zip
+#         !wget -P {root} https://github.com/ARENA-education/ARENA_materials/archive/refs/heads/{branch}.zip
 #         !unzip {root}/{branch}.zip '{repo}-{branch}/{chapter}/exercises/*' -d {root}
 #         !mv {root}/{repo}-{branch}/{chapter} {root}/{chapter}
 #         !rm {root}/{branch}.zip
@@ -280,13 +280,13 @@ import torch as t
 from datasets import load_dataset
 from dotenv import load_dotenv
 from IPython.display import HTML, display
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float, Int
 from plotly.subplots import make_subplots
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.preprocessing import StandardScaler
 from torch import Tensor
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 device = t.device("cuda" if t.cuda.is_available() else "cpu")
@@ -412,6 +412,8 @@ r'''
 r'''
 ## Extracting activations
 
+Note - unlike the earlier sections of this chapter, which used TransformerLens (`HookedTransformer`, `run_with_cache`, hook names like `blocks.{layer}.hook_resid_post`), here we work directly with a HuggingFace `transformers` model (`AutoModelForCausalLM`). This is the most widely used library for running open-weight models, but it isn't built around interpretability, so there's no activation cache or named hook points. Instead, we'll get activations by passing `output_hidden_states=True` to the forward pass (as described below), and later on we'll intervene on activations by registering standard PyTorch forward hooks on the decoder layers, e.g. `model.model.layers[layer].register_forward_hook(hook_fn)`.
+
 Our first task is to extract hidden state activations from the model. For the Geometry of Truth approach, we extract the **last-token** activation at each specified layer. For declarative statements like "The city of Paris is in France.", the model's representation of whether the statement is true or false is concentrated at the final token position.
 
 Note - the Geometry of Truth paper probes specifically at the **end-of-sentence punctuation** token (the period / full stop). The datasets are designed so that every statement ends with a period, meaning the last token is always the period. This is important because the model's truth representation builds up over the sentence and is concentrated at the final punctuation mark.
@@ -440,6 +442,7 @@ Implement a function that extracts the last-token hidden state from specified la
 2. Run the forward pass with `output_hidden_states=True`
 3. For each sequence, find the index of the last non-padding token using `attention_mask`
 4. Extract the hidden state at that position for each requested layer
+5. Move the extracted activations to CPU and cast them to float32 (`.cpu().float()`) before concatenating across batches - this frees up GPU memory, and the later exercises need float32 CPU tensors: the model runs in bfloat16, which `t.linalg.eigh` and `t.linalg.pinv` (used by `get_pca_components` and `MMProbe`) don't support, and the labels and plotting code are on the CPU
 
 <details>
 <summary>Hint - handling padding</summary>
@@ -476,7 +479,7 @@ def extract_activations(
         batch_size: Number of statements to process at once.
 
     Returns:
-        Dictionary mapping layer index to tensor of activations, shape [n_statements, d_model].
+        Dictionary mapping layer index to tensor of activations (on CPU, float32), shape [n_statements, d_model].
     """
     # EXERCISE
     # raise NotImplementedError()
@@ -708,7 +711,7 @@ if MAIN and FLAG_RUN_SECTION_1:
     )
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13102.html")
+    # fig.write_html(section_dir / "13102.html", include_plotlyjs="cdn")
     # END FILTERS
 # END HIDE
 
@@ -870,7 +873,7 @@ if MAIN and FLAG_RUN_SECTION_1:
     )
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13104.html")
+    # fig.write_html(section_dir / "13104.html", include_plotlyjs="cdn")
     # END FILTERS
 
     best_layer = all_layers[int(np.argmax(sweep_results["test_acc"]))]
@@ -975,10 +978,13 @@ r'''
 Implement the Mass-Mean (difference-of-means) probe as a PyTorch `nn.Module`. The key components:
 
 * `direction`: the vector `mean(true_acts) - mean(false_acts)`, stored as a non-trainable parameter
+* `bias`: the vector `0.5 * (mean(true_acts) + mean(false_acts))`, for centering around midpoint
 * `covariance`: the pooled within-class covariance matrix (for optional IID-corrected evaluation)
-* `forward(x, iid=False)`: returns `sigmoid(x @ direction)`, or `sigmoid(x @ inv_cov @ direction)` if `iid=True`
+* `forward(x, iid=False)`: returns `sigmoid((x - bias) @ direction)`, or `sigmoid((x - bias) @ inv_cov @ direction)` if `iid=True`
 * `pred(x, iid=False)`: returns binary predictions (round the probabilities)
 * `from_data(acts, labels)`: class method that constructs a probe from data
+
+Note: The GoT codebase centers each dataset's activations before probing (`collect_acts(center=True)`), which makes a biasless probe valid there. This notebook probes raw activations, so the midpoint bias must be explicit - without it, the score includes the dataset's offset along the direction, costing ~20 points of accuracy.
 '''
 
 # ! CELL TYPE: code
@@ -991,14 +997,19 @@ class MMProbe(t.nn.Module):
         direction: Float[Tensor, " d_model"],
         covariance: Float[Tensor, "d_model d_model"] | None = None,
         atol: float = 1e-3,
+        bias: Float[Tensor, " d_model"] | None = None,
     ):
         super().__init__()
         # EXERCISE
-        # # Store direction and precompute inverse covariance
+        # # Store direction and bias and precompute inverse covariance
         # raise NotImplementedError()
         # END EXERCISE
         # SOLUTION
         self.direction = t.nn.Parameter(direction, requires_grad=False)
+        if bias is not None:
+            self.bias = t.nn.Parameter(bias, requires_grad=False)
+        else:
+            self.bias = None
         if covariance is not None:
             self.inv = t.nn.Parameter(t.linalg.pinv(covariance, hermitian=True, atol=atol), requires_grad=False)
         else:
@@ -1010,6 +1021,8 @@ class MMProbe(t.nn.Module):
         # raise NotImplementedError()
         # END EXERCISE
         # SOLUTION
+        if self.bias is not None:
+            x = x - self.bias
         if iid and self.inv is not None:
             return t.sigmoid(x @ self.inv @ self.direction)
         else:
@@ -1024,6 +1037,7 @@ class MMProbe(t.nn.Module):
         acts: Float[Tensor, "n d_model"],
         labels: Float[Tensor, " n"],
         device: str = "cpu",
+        bias: bool = True,
     ) -> "MMProbe":
         # EXERCISE
         # raise NotImplementedError()
@@ -1039,7 +1053,8 @@ class MMProbe(t.nn.Module):
         centered = t.cat([pos_acts - pos_mean, neg_acts - neg_mean], dim=0)
         covariance = centered.t() @ centered / acts.shape[0]
 
-        return MMProbe(direction, covariance=covariance).to(device)
+        mu_mean = 0.5 * (pos_mean + neg_mean) if bias else None
+        return MMProbe(direction, covariance=covariance, bias=mu_mean).to(device)
         # END SOLUTION
 
 
@@ -1054,7 +1069,7 @@ if MAIN and FLAG_RUN_SECTION_2:
     # Test accuracy
     test_preds = mm_probe.pred(test_acts["cities"])
     test_acc = (test_preds == test_labels["cities"]).float().mean().item()
-    assert test_acc > 0.7, "Expected at least 70% accuracy"
+    assert test_acc > 0.9, "Expected at least 90% accuracy"
 
     print("MMProbe on cities:")
     print(f"  Train accuracy: {train_acc:.3f}")
@@ -1069,8 +1084,8 @@ if MAIN and FLAG_RUN_SECTION_2:
 
 r'''
 <pre style="white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace">MMProbe on cities:
-  Train accuracy: 0.751
-  Test accuracy:  0.743
+  Train accuracy: 0.976
+  Test accuracy:  0.953
   Direction norm: 9.776
   Direction (first 5): [0.04566267877817154, 0.2775959372520447, -0.09119868278503418, 0.09136010706424713, -0.14157512784004211]</pre>
 '''
@@ -1238,7 +1253,7 @@ if MAIN and FLAG_RUN_SECTION_2:
     )
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13106.html")
+    # fig.write_html(section_dir / "13106.html", include_plotlyjs="cdn")
     # END FILTERS
 
 # END HIDE
@@ -1274,9 +1289,9 @@ r'''
 > Cross-dataset generalization is the real test of whether your probe has found a universal truth direction.
 > ```
 
-Train MM and LR probes on each of the 3 curated datasets and evaluate each probe on all 3 datasets, producing 3×3 accuracy matrices. If the model has a unified truth direction, off-diagonal entries should be high. The Geometry of Truth paper reports strong cross-generalization for LR probes at 13B scale, and even stronger at 70B:
+Train MM and LR probes on each of the 3 curated datasets and evaluate each probe on all 3 datasets, producing 3×3 accuracy matrices. If the model has a unified truth direction, off-diagonal entries should be high. The Geometry of Truth paper reports that probes generalize better for larger models, and that generalization across datasets is high for LLaMA-2-13B and 70B (Section 5):
 
-> *"The LR probes transfer almost perfectly: probes trained on any one of our three datasets achieve near-ceiling accuracy on the other two."*
+> *"for LLaMA-2-13B and 70B, generalization is generally high; for example, no matter which probing technique is used, we find that probes trained on larger than + smaller than get > 95% accuracy on sp en trans."*
 
 Do your results agree? You should also compute pairwise cosine similarities between probe directions trained on different datasets to check whether they point in a similar direction.
 '''
@@ -1356,7 +1371,7 @@ if MAIN and FLAG_RUN_SECTION_2:
     fig.update_layout(title="Cross-dataset Generalization (Test Accuracy)", height=400, width=800)
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13107.html")
+    # fig.write_html(section_dir / "13107.html", include_plotlyjs="cdn")
     # END FILTERS
 
     # Cosine similarity between probe directions
@@ -1393,7 +1408,7 @@ r'''
 
 If the model has a single "truth direction" that is shared across domains, then probes trained on *any* dataset should achieve high accuracy on *all* datasets (high off-diagonal entries). If instead the model represents truth in domain-specific ways, you'll see high diagonal (in-distribution) but low off-diagonal (out-of-distribution) accuracy.
 
-The Geometry of Truth paper reports that LR probes generalize almost perfectly at 13B+ scale, which suggests a largely unified truth representation. However, at smaller model scales or for very different domains, you may see more variation.
+The Geometry of Truth paper reports that LR probes generalize well at 13B scale, and best for larger models such as LLaMA-2-70B (*"probes generalize better for larger models"*), which suggests a largely unified truth representation. However, at smaller model scales or for very different domains, you may see more variation.
 
 As a further test, try evaluating your cities probe on the `likely` dataset from the geometry-of-truth repo, which contains nonfactual text with likely or unlikely continuations (code snippets, random text). If the truth probe also separates this dataset, the probe may detect *text probability* rather than *factual truth*. The paper predicts (and confirms) that a well-trained truth probe should **not** separate `likely`, because truth and likelihood are distinct features.
 </details>
@@ -1619,7 +1634,7 @@ if MAIN and FLAG_RUN_SECTION_3:
     )
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13112.html")
+    # fig.write_html(section_dir / "13112.html", include_plotlyjs="cdn")
     # END FILTERS
 # END HIDE
 
@@ -1909,7 +1924,7 @@ if MAIN and FLAG_RUN_SECTION_3:
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13114.html")
+    # fig.write_html(section_dir / "13114.html", include_plotlyjs="cdn")
     # END FILTERS
 # END HIDE
 
@@ -2022,7 +2037,7 @@ if MAIN and FLAG_RUN_SECTION_3:
     )
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13116.html")
+    # fig.write_html(section_dir / "13116.html", include_plotlyjs="cdn")
     # END FILTERS
 # END HIDE
 
@@ -2448,6 +2463,8 @@ You should find that multi-layer aggregation is at least as good as the best sin
 # ! TAGS: []
 
 r'''
+### Training the deception probes
+
 We now train the deception probes. We reuse the `MMProbe` and `LRProbe` classes from Section 2. For the MM probe the direction is simply mean(dishonest) - mean(honest). For the LR probe we use `C=0.001` (matching `reg_coeff=1000` in the deception-detection repo's defaults), which is stronger regularization than the truth probe from Section 2.
 '''
 
@@ -2525,7 +2542,7 @@ if MAIN and FLAG_RUN_SECTION_4:
     )
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13119.html")
+    # fig.write_html(section_dir / "13119.html", include_plotlyjs="cdn")
     # END FILTERS
 
     # Histogram of LR scores on test set
@@ -2548,7 +2565,7 @@ if MAIN and FLAG_RUN_SECTION_4:
     )
     fig.show()
     # FILTERS: ~
-    # fig.write_html(section_dir / "13120.html")
+    # fig.write_html(section_dir / "13120.html", include_plotlyjs="cdn")
     # END FILTERS
 
 # END HIDE
@@ -2651,7 +2668,7 @@ if MAIN and FLAG_RUN_SECTION_4:
     tests.test_deception_steering_hook(DeceptionSteeringHook)
 
 if MAIN and FLAG_RUN_SECTION_4:
-    mms_direction = mm_probe.direction
+    mm_direction = mm_probe.direction
 
     print("=== Causal Steering with Deception Probe Direction ===\n")
 
@@ -2831,19 +2848,7 @@ def score_dialogue(
 
 # HIDE
 if MAIN and FLAG_RUN_SECTION_4:
-    # Quick test using a simple conversation
-    test_msgs = [
-        {"role": "system", "content": "You are helpful."},
-        {"role": "user", "content": "Tell me a fact."},
-        {"role": "assistant", "content": "The sky is blue."},
-    ]
-    test_tokens, test_scores, test_mask = score_dialogue(
-        test_msgs, instruct_model, instruct_tokenizer, mm_probe.direction, mid_layer
-    )
-    assert len(test_tokens) == len(test_scores), "Tokens and scores should have the same length"
-    assert test_mask.sum().item() > 0, "Should have at least one assistant token"
-    assert "blue" in "".join(test_tokens), "Should include content tokens"
-    print("score_dialogue test passed!")
+    tests.test_score_dialogue(score_dialogue, instruct_model, instruct_tokenizer, mm_probe.direction, mid_layer)
 # END HIDE
 
 # ! CELL TYPE: code
@@ -3155,7 +3160,7 @@ if MAIN and FLAG_RUN_SECTION_4_70B:
     fig.show()
 
     # FILTERS: ~
-    # fig.write_html(section_dir / "13125.html")
+    # fig.write_html(section_dir / "13125.html", include_plotlyjs="cdn")
     # END FILTERS
 # END HIDE
 
@@ -3417,51 +3422,53 @@ if MAIN and FLAG_RUN_SECTION_5:
 # ! TAGS: []
 
 r'''
-### Exercise - implement `extract_full_sequence_activations`
+### Exercise - implement `naive_extract_full_sequence_activations`
 
 > ```yaml
-> Difficulty: 🔴🔴🔴⚪⚪
+> Difficulty: 🔴🔴⚪⚪⚪
 > Importance: 🔵🔵🔵🔵⚪
 > 
-> You should spend up to 15-20 minutes on this exercise.
+> You should spend up to 10-15 minutes on this exercise.
 > ```
 
-Implement `extract_full_sequence_activations`. This extends the `extract_activations` function from Section 1: instead of returning only the hidden state at the last real token, it returns the full sequence of hidden states at a given layer.
+Implement `naive_extract_full_sequence_activations`. This extends the `extract_activations` function from Section 1: instead of returning only the hidden state at the last real token, it returns the full sequence of hidden states at a given layer.
 
 Return type: a tuple `(activations, mask)` where:
 - `activations` has shape `(n_texts, max_length, d_model)`, dtype float32, on CPU
 - `mask` has shape `(n_texts, max_length)`, dtype bool, `True` for real tokens and `False` for padding
 
-Use `padding="max_length"` with a fixed `max_length` so all batches produce tensors of the same shape, making concatenation across batches straightforward. The boolean mask is what `AttnLite` (and our probe below) expects: it uses it to fill padding positions with `-inf` before softmax.
+Some tips:
 
-<details>
-<summary>Hint - hidden_states indexing</summary>
+- Tokenize all the texts at once with `padding="max_length", truncation=True, max_length=max_length`, so they all come out exactly `max_length` tokens long, and run them through the model in a single forward pass. (That's fine for the handful of texts we'll use this function on, but not for thousands: see below.)
+- As in Section 1, run the model with `output_hidden_states=True` and take `hidden_states[layer + 1]` (index 0 is the embedding output).
+- The mask is the tokenizer's `attention_mask`, as bools.
 
-`outputs.hidden_states[0]` is the embedding layer output. `outputs.hidden_states[layer + 1]` is the output of transformer layer `layer`. This is the same offset as in `extract_activations` from Section 1.
-</details>
+The boolean mask is what `AttnLite` (and our probe below) expects: it uses it to fill padding positions with `-inf` before softmax.
+
+Don't worry about speed here: after this exercise, we explain how to make this much faster, and give you `extract_full_sequence_activations`, which returns the same tensors and works on thousands of texts.
 '''
 
 # ! CELL TYPE: code
 # ! FILTERS: []
 # ! TAGS: [main]
 
-def extract_full_sequence_activations(
+@t.no_grad()
+def naive_extract_full_sequence_activations(
     texts: list[str],
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     layer: int,
-    batch_size: int = 8,
     max_length: int = 256,
 ) -> tuple[Float[Tensor, "n seq d_model"], Bool[Tensor, "n seq"]]:
     """
-    Extract full-sequence hidden states from a given layer for a list of texts.
+    Extract full-sequence hidden states from a given layer for a list of texts, in a single forward pass (so only use
+    this on a handful of texts).
 
     Args:
         texts:      List of formatted text strings to process.
         model:      A HuggingFace causal language model.
         tokenizer:  The corresponding tokenizer.
         layer:      Layer index (0-indexed) to extract activations from.
-        batch_size: Number of texts per forward pass.
         max_length: Fixed sequence length to pad/truncate all inputs to.
 
     Returns:
@@ -3473,46 +3480,214 @@ def extract_full_sequence_activations(
     # raise NotImplementedError()
     # END EXERCISE
     # SOLUTION
-    all_acts: list[Float[Tensor, "batch seq d_model"]] = []
-    all_masks: list[Bool[Tensor, "batch seq"]] = []
-
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=max_length,
-        ).to(model.device)
-
-        with t.no_grad():
-            outputs = model(**inputs, output_hidden_states=True)
-
-        # hidden_states[0] is the embedding; hidden_states[layer+1] is transformer layer output
-        hidden = outputs.hidden_states[layer + 1].cpu().float()  # (batch, seq, d_model)
-        mask = inputs["attention_mask"].bool().cpu()  # (batch, seq)
-
-        all_acts.append(hidden)
-        all_masks.append(mask)
-
-    return t.cat(all_acts, dim=0), t.cat(all_masks, dim=0)
+    inputs = tokenizer(
+        texts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length
+    ).to(model.device)
+    outputs = model(**inputs, output_hidden_states=True)
+    return outputs.hidden_states[layer + 1].cpu().float(), inputs["attention_mask"].bool().cpu()
     # END SOLUTION
 
 
 # HIDE
 if MAIN and FLAG_RUN_SECTION_5:
-    test_acts, test_masks = extract_full_sequence_activations(
-        hs_train_texts[:4], hs_model, hs_tokenizer, HS_LAYER, batch_size=4, max_length=HS_MAX_LEN
+    tests.test_naive_extract_full_sequence_activations(naive_extract_full_sequence_activations, hs_tokenizer)
+# END HIDE
+
+# ! CELL TYPE: markdown
+# ! FILTERS: []
+# ! TAGS: []
+
+r'''
+## Making it effective
+
+The function you just wrote has a lot of problems:
+* It runs every text through all 32 layers, padded to 256 tokens, in a single forward pass.
+* We don't actually need layers beyond the one of interest.
+* Prompts are of variable length, and most prompts are much shorter than 256 tokens, 
+  so many short prompts get padded to maximum length, and we're mostly processing padding tokens.
+  
+Below are tricks that together cut the work by about 4x on our training
+set, while being functionally equivalent to the naive implementation above.
+'''
+
+# ! CELL TYPE: markdown
+# ! FILTERS: []
+# ! TAGS: []
+
+r'''
+### Running the model only up to the probed layer
+
+To probe activations from a layer, we don't need to run the the layers afterwards. 
+HuggingFace models don't have an argument for stopping the forward pass 
+part-way (`output_hidden_states=True` still runs every layer), 
+so we use a standard trick instead: a **forward hook that bails out**.
+
+- To stop before layer `stop_at_layer`, we register a forward hook on the layer before it, `model.model.layers[stop_at_layer - 1]`. 
+- The hook caches the output of that transformer block, then raise a custom exception. 
+- We catch the custom exception (ensuring real model errors still get raised), and then remove the hook function.
+
+This feels hacky, and it is, but [nnsight's `tracer.stop()`](https://github.com/ndif-team/nnsight/blob/v0.7.0/src/nnsight/intervention/interleaver.py#L1370) does exactly the same thing. 
+
+TransformerLens models provide a `stop_at_layer` argument,
+but only because it implements the forward pass from scratch.
+
+<!-- TODO: this is redundant once we moved to TransformerLens 4 -->
+
+We've given you `forward_to_layer` below; the faster extraction function uses it. Its `stop_at_layer` argument works like TransformerLens's: `forward_to_layer(model, **inputs, stop_at_layer=k)` runs layers `0, ..., k - 1` (counting from 0, as in `model.model.layers`) and returns the residual stream going into layer `k`, which is
+functionally identical to `model(**inputs, output_hidden_states=True).hidden_states[k]`.
+ - `hidden_states[0]` is the embedding output (the input to layer 0), so `hidden_states[k]` is the output of layer `k - 1`.
+   So to get the output of layer `L`, use `stop_at_layer=L + 1` (in TransformerLens, that's `blocks.L.hook_resid_post`).
+ - HuggingFace's last hidden state, `hidden_states[-1]`, is the residual stream
+   *after* the final norm (just before the unembedding), not the raw output of the last layer.
+   So we match that implementation here.
+'''
+
+# ! CELL TYPE: code
+# ! FILTERS: []
+# ! TAGS: []
+
+class EarlyStopException(Exception):
+    """Raised from a hook to end a forward pass early."""
+
+def forward_to_layer(
+    model: AutoModelForCausalLM,
+    input_ids: Int[Tensor, "batch seq"],
+    attention_mask: Int[Tensor, "batch seq"] | None = None,
+    stop_at_layer: int | None = None,
+    **kwargs,
+) -> Float[Tensor, "batch seq d_model"]:
+    """
+    Runs `model`, stopping before decoder layer `stop_at_layer` (like TransformerLens's `stop_at_layer` argument), and
+    returns the residual stream at that point, i.e. the output of layer `stop_at_layer - 1`.
+
+    Functionally identical to
+    `model(input_ids, attention_mask=attention_mask, output_hidden_states=True, **kwargs).hidden_states[stop_at_layer]`,
+    but skips running the later layers.
+
+    Args:
+        model:          A HuggingFace causal language model (its decoder layers are `model.model.layers`).
+        input_ids:      Token ids, shape (batch, seq).
+        attention_mask: 1 for real tokens, 0 for padding, shape (batch, seq). None if there's no padding.
+        stop_at_layer:  Run layers 0, ..., stop_at_layer - 1, between 1 and n_layers. Negative values count from the end,
+                        like a slice: -1 runs every layer but the last. If n_layers, the output also has the model's final
+                        norm applied, to match `hidden_states[-1]`. If None, just runs the model normally.
+        **kwargs:       Any other arguments for `model(...)`, passed along unchanged.
+
+    Returns:
+        The residual stream before layer `stop_at_layer`, shape (batch, seq, d_model) (or, if `stop_at_layer` is None,
+        the model's usual output).
+    """
+    if stop_at_layer is None:
+        return model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+    num_layers = len(model.model.layers)
+    assert stop_at_layer != 0 and -num_layers < stop_at_layer <= num_layers, (
+        f"forward_to_layer: {stop_at_layer=} must be in 1..{num_layers} (or -{num_layers - 1}..-1)"
     )
-    assert test_acts.shape == (4, HS_MAX_LEN, HS_D_MODEL), (
-        f"Expected (4, {HS_MAX_LEN}, {HS_D_MODEL}), got {test_acts.shape}"
-    )
-    assert test_masks.shape == (4, HS_MAX_LEN), f"Expected (4, {HS_MAX_LEN}), got {test_masks.shape}"
-    assert test_masks.dtype == t.bool, f"Mask should be bool, got {test_masks.dtype}"
-    assert test_masks[:, 0].all(), "First token should always be a real token"
-    assert t.isfinite(test_acts[test_masks]).all(), "Real-token activations should be finite"
-    print("extract_full_sequence_activations tests passed!")
+    if stop_at_layer < 0:
+        stop_at_layer += num_layers  # e.g. -1 -> num_layers - 1, i.e. every layer but the last
+    captured = {}
+
+    def hook(module, args, output):
+        # Decoder layers return either a tensor or a tuple whose first element is the hidden state
+        captured["output"] = output[0] if isinstance(output, tuple) else output
+        raise EarlyStopException  # end the forward pass here
+
+    # The residual stream going into layer `stop_at_layer` is the output of layer `stop_at_layer - 1`
+    hook_fn = model.model.layers[stop_at_layer - 1].register_forward_hook(hook)
+    try:
+        model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    except EarlyStopException: # skip the rest of the model
+        pass 
+    finally:
+        hook_fn.remove()
+
+    output = captured["output"]
+    # HF's last hidden state has the final norm applied: match it
+    if stop_at_layer == num_layers:
+        output = model.model.norm(output)  
+    return output
+
+# ! CELL TYPE: markdown
+# ! FILTERS: []
+# ! TAGS: []
+
+r'''
+### Batching texts of similar length
+
+Most of our prompts are short (median ~90 tokens), but a few are much longer, hitting the 256-token limit. 
+By default, a batch is padded to its longest text, so if we draw prompts from the data set in a random
+order, most batchs contains at least one long prompt, and *all* the prompts in that batch 
+are padded to max length. 
+
+**Sorting the texts by length first** puts all the short prompts
+in the same batch so they don't get padded out, saving compute.
+
+`extract_full_sequence_activations` below does this: it tokenizes all the texts at once, sorts them by length,
+and feeds them to the model in chunks of similar length.
+
+### Pre-allocation of tensors
+
+We already know the size of the tensors that we want, so collecting lots of large
+tensors into a list and then combining them with `t.cat` means that we briefly
+hold two full copies of the tensors in memory. Pre-allocating a block of memory once
+for the output, and then writing the chunks into it is both faster and uses less memory.
+
+Combining all the above give us the much faster version below.
+'''
+
+# ! CELL TYPE: code
+# ! FILTERS: []
+# ! TAGS: []
+
+@t.no_grad()
+def extract_full_sequence_activations(
+    texts: list[str],
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    layer: int,
+    chunk_size: int = 8,
+    max_length: int = 256,
+) -> tuple[Float[Tensor, "n seq d_model"], Bool[Tensor, "n seq"]]:
+    """
+    Same as `naive_extract_full_sequence_activations`, but runs the texts in chunks of `chunk_size` (so it works on
+    thousands of texts), and much faster: see the explanation above.
+
+    Args:
+        texts:      List of formatted text strings to process.
+        model:      A HuggingFace causal language model.
+        tokenizer:  The corresponding tokenizer.
+        layer:      Layer index (0-indexed) to extract activations from.
+        chunk_size: Number of texts per forward pass.
+        max_length: Fixed sequence length to pad/truncate all inputs to.
+
+    Returns:
+        Tuple of (activations, mask):
+            activations: shape (n, max_length, d_model), float32 on CPU.
+            mask:        shape (n, max_length), bool, True = real token.
+    """
+    assert tokenizer.padding_side == "right", "cutting off padding columns below assumes right padding"
+    tokens = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=max_length)
+    lengths = tokens["attention_mask"].sum(dim=-1)  # number of real tokens in each text
+    order = t.argsort(lengths, stable=True)  # similar lengths per chunk -> little padding
+
+    acts = t.zeros(len(texts), max_length, model.config.hidden_size)
+    masks = t.zeros(len(texts), max_length, dtype=t.bool)
+    for idx in t.split(order, chunk_size):  # this chunk's indices into `texts`
+        seq_len = lengths[idx].max().item()  # the chunk's longest text: columns after it are all padding
+        input_ids = tokens["input_ids"][idx, :seq_len].to(model.device)
+        attention_mask = tokens["attention_mask"][idx, :seq_len].to(model.device)
+
+        hidden = forward_to_layer(model, input_ids, attention_mask, stop_at_layer=layer + 1).cpu().float()
+        acts[idx, :seq_len] = hidden  # positions after seq_len stay 0
+        masks[idx, :seq_len] = attention_mask.bool().cpu()
+
+    return acts, masks
+
+
+# HIDE
+if MAIN and FLAG_RUN_SECTION_5:
+    tests.test_extract_full_sequence_activations(extract_full_sequence_activations, hs_tokenizer)
 # END HIDE
 
 # ! CELL TYPE: code
@@ -3523,10 +3698,10 @@ if MAIN and FLAG_RUN_SECTION_5:
 if MAIN and FLAG_RUN_SECTION_5:
     print("Extracting activations for train and test sets...")
     hs_acts_train, hs_masks_train = extract_full_sequence_activations(
-        hs_train_texts, hs_model, hs_tokenizer, HS_LAYER, batch_size=8, max_length=HS_MAX_LEN
+        hs_train_texts, hs_model, hs_tokenizer, HS_LAYER, chunk_size=8, max_length=HS_MAX_LEN
     )
     hs_acts_test, hs_masks_test = extract_full_sequence_activations(
-        hs_test_texts, hs_model, hs_tokenizer, HS_LAYER, batch_size=8, max_length=HS_MAX_LEN
+        hs_test_texts, hs_model, hs_tokenizer, HS_LAYER, chunk_size=8, max_length=HS_MAX_LEN
     )
     print(f"Train: {hs_acts_train.shape}, Test: {hs_acts_test.shape}")
 
@@ -3698,37 +3873,7 @@ class AttentionProbe(t.nn.Module):
 
 # HIDE
 if MAIN and FLAG_RUN_SECTION_5:
-    t.manual_seed(0)
-    batch, seq_len, d, n_heads = 3, 12, 32, 2
-    x = t.randn(batch, seq_len, d)
-    mask = t.ones(batch, seq_len, dtype=t.bool)
-    mask[0, 8:] = False  # 4 padding tokens for first example
-    mask[1, 11:] = False  # 1 padding token for second example
-    W_q = t.randn(d, n_heads) * 0.1
-    W_out = t.randn(n_heads * d, 1) * 0.1
-    b_out = t.zeros(1)
-    scale = d**0.5
-
-    logits, attn = attention_probe_forward(x, mask, W_q, W_out, b_out, scale)
-
-    assert logits.shape == (batch,), f"Logits shape: {logits.shape}, expected ({batch},)"
-    assert attn.shape == (batch, seq_len, n_heads), (
-        f"Attn shape: {attn.shape}, expected ({batch}, {seq_len}, {n_heads})"
-    )
-    # Weights over valid positions must sum to 1 per head
-    assert t.allclose(attn[0, :8, :].sum(0), t.ones(n_heads), atol=1e-5), (
-        "Attention weights over valid tokens should sum to 1 per head"
-    )
-    # Padding positions should receive negligible weight
-    assert (attn[0, 8:, :].abs() < 1e-5).all(), "Padding positions should have ~0 attention weight"
-    assert t.isfinite(logits).all(), "Logits should be finite"
-
-    # Verify the class wraps it correctly
-    probe = AttentionProbe(d_model=d, n_heads=n_heads)
-    probe_logits = probe(x, mask)
-    assert probe_logits.shape == (batch,)
-
-    print("attention_probe_forward tests passed!")
+    tests.test_attention_probe_forward(attention_probe_forward, AttentionProbe)
 # END HIDE
 
 # ! CELL TYPE: markdown
@@ -3745,35 +3890,62 @@ The paper reports that `AttnLite` consistently outperforms simpler aggregation s
 
 # ! CELL TYPE: code
 # ! FILTERS: []
+# ! TAGS: []
+
+def train_probe_full_batch(
+    probe: t.nn.Module,
+    acts: Float[Tensor, "n seq d_model"],
+    masks: Bool[Tensor, "n seq"],
+    labels: Float[Tensor, " n"],
+    n_epochs: int = 200,
+    lr: float = 5e-3,
+    weight_decay: float = 1e-3,
+    chunk_size: int = 128,
+) -> t.nn.Module:
+    """
+    Trains `probe(acts, masks) -> logits` with full-batch AdamW + binary cross-entropy for `n_epochs`, on the GPU if
+    there is one, and returns it in eval mode on the CPU.
+
+    Engineering details (they don't change the result): the activations are moved to the GPU once, in bfloat16 (they are
+    bfloat16 model outputs, so this is lossless, and it halves the ~12 GB they'd take in float32 next to the model). Each
+    epoch's gradient is accumulated over chunks of `chunk_size` examples, each upcast to float32, which adds up to exactly
+    the full-batch gradient.
+    """
+    device = t.device("cuda" if t.cuda.is_available() else "cpu")
+    acts = acts.to(device=device, dtype=t.bfloat16)
+    masks, labels = masks.to(device), labels.to(device)
+    probe = probe.to(device)
+    optimizer = t.optim.AdamW(probe.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = t.nn.BCEWithLogitsLoss(reduction="sum")
+    n = acts.shape[0]
+
+    probe.train()
+    for _ in range(n_epochs):
+        optimizer.zero_grad()
+        for start in range(0, n, chunk_size):
+            logits = probe(acts[start : start + chunk_size].float(), masks[start : start + chunk_size])
+            loss = criterion(logits, labels[start : start + chunk_size]) / n  # sum over chunks / n = full-batch mean
+            loss.backward()
+        optimizer.step()
+
+    return probe.eval().cpu()
+
+# ! CELL TYPE: code
+# ! FILTERS: []
 # ! TAGS: [main]
 
 # HIDE
 if MAIN and FLAG_RUN_SECTION_5:
 
-    def train_attention_probe(
-        acts: Float[Tensor, "n seq d_model"],
-        masks: Bool[Tensor, "n seq"],
-        labels: Float[Tensor, "n"],
-        n_heads: int = 1,
-        n_epochs: int = 200,
-        lr: float = 5e-3,
-        weight_decay: float = 1e-3,
-    ) -> "AttentionProbe":
-        probe = AttentionProbe(d_model=acts.shape[-1], n_heads=n_heads)
-        optimizer = t.optim.AdamW(probe.parameters(), lr=lr, weight_decay=weight_decay)
-        criterion = t.nn.BCEWithLogitsLoss()
-
-        probe.train()
-        for _ in range(n_epochs):
-            logits = probe(acts, masks)
-            loss = criterion(logits, labels)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        return probe.eval()
-
-    attn_probe = train_attention_probe(hs_acts_train, hs_masks_train, hs_train_labels, n_heads=1)
+    attn_probe = train_probe_full_batch(
+        AttentionProbe(d_model=hs_acts_train.shape[-1], n_heads=1),
+        hs_acts_train,
+        hs_masks_train,
+        hs_train_labels,
+        n_epochs=200,
+        lr=5e-3,
+        weight_decay=1e-3,
+    )
 
     with t.no_grad():
         attn_scores_test = attn_probe(hs_acts_test, hs_masks_test).sigmoid().numpy()
@@ -3825,7 +3997,7 @@ if MAIN and FLAG_RUN_SECTION_5:
     )
     fig.show()
     # FILTERS: ~
-    fig.write_html(section_dir / "13128.html")
+    fig.write_html(section_dir / "13128.html", include_plotlyjs="cdn")
     # END FILTERS
 # END HIDE
 
@@ -3891,7 +4063,7 @@ if MAIN and FLAG_RUN_SECTION_5:
         print(f"{cfg}: {len(eval_texts)} examples ({n_hi} high, {len(eval_texts) - n_hi} low)")
 
         eval_acts, eval_masks = extract_full_sequence_activations(
-            eval_texts, hs_model, hs_tokenizer, HS_LAYER, batch_size=8, max_length=HS_MAX_LEN
+            eval_texts, hs_model, hs_tokenizer, HS_LAYER, chunk_size=8, max_length=HS_MAX_LEN
         )
         eval_last = last_token_acts(eval_acts, eval_masks)
         eval_mean = mean_pool_acts(eval_acts, eval_masks)
@@ -4009,7 +4181,7 @@ if MAIN and FLAG_RUN_SECTION_5:
         )
         bar_fig.show()
         # FILTERS: ~
-        bar_fig.write_html(section_dir / f"13130_bar_{ex}.html")
+        bar_fig.write_html(section_dir / f"13130_bar_{ex}.html", include_plotlyjs="cdn")
         # END FILTERS
 # END HIDE
 
